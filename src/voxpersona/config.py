@@ -14,11 +14,15 @@ class PipelineMode(Enum):
     SPEECH_TO_SPEECH : STT → LLM → TTS  (full voice pipeline)
     LLM_TTS          : LLM → TTS        (text in, voice out)
     LLM_ONLY         : LLM              (text in, text out)
+    TEST_MIC         : STT only          (mic/audio → Whisper → print text)
+    TEST_VOICE       : TTS only          (text → F5-TTS → audio playback)
     """
 
     SPEECH_TO_SPEECH = "speech_to_speech"
     LLM_TTS = "llm_tts"
     LLM_ONLY = "llm_only"
+    TEST_MIC = "test_mic"
+    TEST_VOICE = "test_voice"
 
     @classmethod
     def from_str(cls, value: str) -> "PipelineMode":

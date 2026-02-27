@@ -3,9 +3,12 @@ VoxPersona pipeline — orchestrates STT, LLM and TTS components.
 
 Supports three pipeline modes that determine which components are loaded:
 
-* ``SPEECH_TO_SPEECH``: Whisper ASR → Qwen LLM → F5-TTS  (full voice loop)
+* ``SPEECH_TO_SPEECH``: Audio → Whisper ASR → Qwen LLM → F5-TTS  (full voice loop)
+      Audio source can be **microphone** (/mic, /listen) or **any audio file** (/audio).
 * ``LLM_TTS``         : Qwen LLM → F5-TTS                (text in, voice out)
 * ``LLM_ONLY``        : Qwen LLM                          (text in, text out)
+* ``TEST_MIC``        : Whisper ASR only                  (audio → text, for testing STT)
+* ``TEST_VOICE``      : F5-TTS only                       (text → audio, for testing TTS)
 
 Components that are not required by the selected mode are **never loaded**,
 keeping GPU memory usage minimal.
@@ -52,29 +55,55 @@ class VoxPersonaPipeline:
     def _init_components(self) -> None:
         """Instantiate only the components required by ``self.mode``."""
 
-        needs_stt = self.mode is PipelineMode.SPEECH_TO_SPEECH
-        needs_tts = self.mode in (PipelineMode.SPEECH_TO_SPEECH, PipelineMode.LLM_TTS)
+        needs_asr = self.mode in (
+            PipelineMode.SPEECH_TO_SPEECH,
+            PipelineMode.TEST_MIC,
+        )
+        needs_mic = self.mode in (
+            PipelineMode.SPEECH_TO_SPEECH,
+            PipelineMode.TEST_MIC,
+        )
+        needs_llm = self.mode in (
+            PipelineMode.SPEECH_TO_SPEECH,
+            PipelineMode.LLM_TTS,
+            PipelineMode.LLM_ONLY,
+        )
+        needs_tts = self.mode in (
+            PipelineMode.SPEECH_TO_SPEECH,
+            PipelineMode.LLM_TTS,
+            PipelineMode.TEST_VOICE,
+        )
 
-        # -- STT + mic recorders (only for speech-to-speech) --
-        if needs_stt:
-            self._init_stt()
-
-        # -- LLM (always needed) --
-        self._init_llm()
-
-        # -- TTS (speech-to-speech & llm_tts) --
+        if needs_asr:
+            self._init_asr()
+        if needs_mic:
+            self._init_mic()
+        if needs_llm:
+            self._init_llm()
         if needs_tts:
             self._init_tts()
 
         logger.info(
-            "Components loaded — STT=%s  LLM=True  TTS=%s",
-            needs_stt,
+            "Components loaded — ASR=%s  MIC=%s  LLM=%s  TTS=%s",
+            self.asr is not None,
+            self.recorder is not None,
+            self.chat is not None,
             self.tts is not None,
         )
 
-    def _init_stt(self) -> None:
-        from voxpersona.audio.recorder import ContinuousMicRecorder, MicrophoneRecorder
+    def _init_asr(self) -> None:
+        """Load Whisper ASR — accepts audio from *any* source (mic or file)."""
         from voxpersona.models.whisper_asr import WhisperASR
+
+        self.asr = WhisperASR(
+            model_id=self.config.whisper_model_id,
+            device=self.config.device,
+            chunk_length_s=self.config.asr_chunk_length_s,
+        )
+
+    def _init_mic(self) -> None:
+        """Load microphone recorders (fixed-duration + continuous VAD)."""
+        from voxpersona.audio.recorder import ContinuousMicRecorder, MicrophoneRecorder
 
         self.recorder = MicrophoneRecorder(
             sample_rate=self.config.mic_sample_rate,
@@ -89,11 +118,6 @@ class VoxPersonaPipeline:
             max_speech_s=self.config.vad_max_speech_s,
             output_dir="./outputs",
             prefix="utterance",
-        )
-        self.asr = WhisperASR(
-            model_id=self.config.whisper_model_id,
-            device=self.config.device,
-            chunk_length_s=self.config.asr_chunk_length_s,
         )
 
     def _init_llm(self) -> None:
@@ -131,31 +155,86 @@ class VoxPersonaPipeline:
     # ── Capability checks ───────────────────────────────────────────
 
     @property
-    def has_stt(self) -> bool:
+    def has_asr(self) -> bool:
+        """True when Whisper ASR is loaded (any audio → text)."""
         return self.asr is not None
+
+    @property
+    def has_mic(self) -> bool:
+        """True when microphone recorders are available."""
+        return self.recorder is not None
+
+    @property
+    def has_llm(self) -> bool:
+        """True when Qwen LLM is loaded."""
+        return self.chat is not None
 
     @property
     def has_tts(self) -> bool:
         return self.tts is not None
 
-    def _require_stt(self, action: str) -> None:
-        if not self.has_stt:
+    # Backward compat alias
+    has_stt = has_asr
+
+    def _require_asr(self, action: str) -> None:
+        if not self.has_asr:
             raise RuntimeError(
-                f"Cannot {action}: STT is not available in '{self.mode.value}' mode. "
+                f"Cannot {action}: ASR is not available in '{self.mode.value}' mode. "
                 "Use 'speech_to_speech' mode for voice input."
+            )
+
+    def _require_mic(self, action: str) -> None:
+        if not self.has_mic:
+            raise RuntimeError(
+                f"Cannot {action}: Microphone is not available in '{self.mode.value}' mode. "
+                "Use 'speech_to_speech' mode for mic input."
+            )
+
+    def _require_llm(self, action: str) -> None:
+        if not self.has_llm:
+            raise RuntimeError(
+                f"Cannot {action}: LLM is not available in '{self.mode.value}' mode."
+            )
+
+    def _require_tts(self, action: str) -> None:
+        if not self.has_tts:
+            raise RuntimeError(
+                f"Cannot {action}: TTS is not available in '{self.mode.value}' mode. "
+                "Ensure F5_ENABLED=true and use a pipeline with TTS."
             )
 
     # ── Single-turn helpers ─────────────────────────────────────────
 
     def run_text_turn(self, user_text: str) -> TurnResult:
-        """Text → LLM → (optional) TTS.  Available in ALL modes."""
+        """Text → LLM → (optional) TTS.  Requires LLM."""
+        self._require_llm("run text turn")
+        assistant_text = self.chat.call_stream(user_text)
+        tts_path = self._maybe_tts(assistant_text)
+        return TurnResult(user_text=user_text, assistant_text=assistant_text, tts_audio_path=tts_path)
+
+    def run_audio_turn(self, audio_path: str) -> TurnResult:
+        """Audio file → STT → LLM → (optional) TTS.
+
+        Accepts **any** audio file (wav, mp3, flac, …) that Whisper can
+        decode.  The audio does not need to come from the microphone —
+        it can be a pre-recorded file, an upload, or output from another
+        pipeline.
+        """
+        self._require_asr("transcribe audio file")
+
+        from pathlib import Path
+        path = Path(audio_path)
+        if not path.is_file():
+            raise FileNotFoundError(f"Audio file not found: {audio_path}")
+
+        user_text = self.asr.transcribe(str(path))
         assistant_text = self.chat.call_stream(user_text)
         tts_path = self._maybe_tts(assistant_text)
         return TurnResult(user_text=user_text, assistant_text=assistant_text, tts_audio_path=tts_path)
 
     def run_mic_turn(self, record_seconds: Optional[int] = None, output_wav: str = "./outputs/mic_input.wav") -> TurnResult:
-        """Mic → STT → LLM → (optional) TTS.  Requires SPEECH_TO_SPEECH mode."""
-        self._require_stt("record from microphone")
+        """Mic → STT → LLM → (optional) TTS.  Requires mic hardware."""
+        self._require_mic("record from microphone")
         seconds = record_seconds or self.config.mic_record_seconds
         wav_path = self.recorder.record_to_wav(seconds=seconds, output_path=output_wav)
         user_text = self.asr.transcribe(wav_path)
@@ -176,7 +255,7 @@ class VoxPersonaPipeline:
 
         Requires ``SPEECH_TO_SPEECH`` mode.
         """
-        self._require_stt("continuous listen")
+        self._require_mic("continuous listen")
         print("[Listen] Mic liên tục — nói bất cứ lúc nào.  Ctrl-C để dừng.")
         try:
             for wav_path in self.continuous_recorder.listen():
@@ -204,6 +283,52 @@ class VoxPersonaPipeline:
         """Stop the continuous recorder (no-op if recorder is not loaded)."""
         if self.continuous_recorder is not None:
             self.continuous_recorder.stop()
+
+    # ── Test-only turns ─────────────────────────────────────────────
+
+    def run_test_asr(self, audio_path: str) -> str:
+        """Transcribe an audio file and return the text.  No LLM, no TTS.
+
+        Use this to quickly verify that Whisper is working or to benchmark
+        transcription quality / latency.
+        """
+        self._require_asr("run test ASR")
+
+        from pathlib import Path
+        path = Path(audio_path)
+        if not path.is_file():
+            raise FileNotFoundError(f"Audio file not found: {audio_path}")
+
+        return self.asr.transcribe(str(path))
+
+    def run_test_mic_asr(
+        self,
+        record_seconds: Optional[int] = None,
+        output_wav: str = "./outputs/test_mic.wav",
+    ) -> str:
+        """Record from mic then transcribe.  No LLM, no TTS."""
+        self._require_mic("run test mic ASR")
+        seconds = record_seconds or self.config.mic_record_seconds
+        wav_path = self.recorder.record_to_wav(seconds=seconds, output_path=output_wav)
+        return self.asr.transcribe(wav_path)
+
+    def run_test_tts(self, text: str, output_path: Optional[str] = None) -> str:
+        """Synthesize *text* with F5-TTS and return the output path.
+
+        No ASR, no LLM.  Use this to test voice cloning quality or
+        experiment with ref_audio / ref_text settings.
+        """
+        self._require_tts("run test TTS")
+        if not self.config.f5_ref_text:
+            raise ValueError("F5_REF_TEXT is required for TTS synthesis.")
+
+        out = output_path or self.config.f5_output_path
+        return self.tts.synthesize(
+            ref_audio=self.config.f5_ref_audio,
+            ref_text=self.config.f5_ref_text,
+            gen_text=text,
+            output_path=out,
+        )
 
     # ── TTS helper ──────────────────────────────────────────────────
 
