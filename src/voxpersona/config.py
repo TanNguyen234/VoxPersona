@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from enum import Enum
 import os
 
 from dotenv import load_dotenv
@@ -7,8 +8,34 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
+class PipelineMode(Enum):
+    """Defines which components the pipeline should load.
+
+    SPEECH_TO_SPEECH : STT → LLM → TTS  (full voice pipeline)
+    LLM_TTS          : LLM → TTS        (text in, voice out)
+    LLM_ONLY         : LLM              (text in, text out)
+    """
+
+    SPEECH_TO_SPEECH = "speech_to_speech"
+    LLM_TTS = "llm_tts"
+    LLM_ONLY = "llm_only"
+
+    @classmethod
+    def from_str(cls, value: str) -> "PipelineMode":
+        """Resolve a pipeline mode from a case-insensitive string."""
+        lookup = {m.value: m for m in cls}
+        normalised = value.strip().lower()
+        if normalised not in lookup:
+            valid = ", ".join(sorted(lookup))
+            raise ValueError(f"Unknown pipeline mode '{value}'. Choose from: {valid}")
+        return lookup[normalised]
+
+
 @dataclass(frozen=True)
 class AppConfig:
+    # ── Pipeline mode ──
+    pipeline_mode: str = os.getenv("PIPELINE_MODE", "speech_to_speech")
+
     whisper_model_id: str = os.getenv("WHISPER_MODEL_ID", "openai/whisper-large-v3-turbo")
     qwen_model_id: str = os.getenv("QWEN_MODEL_ID", "Qwen/Qwen2.5-7B-Instruct")
     device: str = os.getenv("DEVICE", "auto")
